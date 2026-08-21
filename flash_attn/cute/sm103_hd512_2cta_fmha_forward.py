@@ -34,6 +34,7 @@ import flash_attn.cute.pipeline as pipeline_custom
 from flash_attn.cute.utils import ex2_emulation_2, as_bshkrd_tensor, AuxData
 import flash_attn.cute.utils as fa_utils
 from flash_attn.cute.paged_kv import PagedKVManager
+from flash_attn.cute.pack_gqa import pack_gqa_layout
 
 
 class BlackwellHd512FusedMultiHeadAttentionForward:
@@ -71,7 +72,7 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
         assert mask_mod is None, "SM103 forward with head_dim=512 does not support mask_mod"
         assert not has_aux_tensors, "SM103 forward with head_dim=512 does not support aux tensors"
         self.use_tma_KV = not paged_kv_non_tma
-        assert not pack_gqa, "SM103 forward with head_dim=512 does not support pack_gqa"
+        self.pack_gqa = pack_gqa
         assert not is_split_kv, "SM103 forward with head_dim=512 does not support SplitKV"
         assert q_subtile_factor == 1, (
             "SM103 forward with head_dim=512 does not support q_subtile_factor"
@@ -80,7 +81,7 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
             "SM103 forward with head_dim=512 does not support kv_subtile_factor"
         )
         assert m_block_size == 64 and n_block_size == 128, (
-            "SM103 hd512 dedicated kernel only supports tile_m=64 and tile_n=128"
+            "SM103 hd512 dedicated kernel requires tile_m=64 and tile_n=128"
         )
         # q_stage / persistence / scheduler knobs are accepted for interface parity,
         # but this dedicated kernel uses fixed internal settings.
@@ -349,11 +350,12 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
         q = cute.make_tensor(
             q_norm.iterator,
             cute.make_layout(
-                (s_q_total, d, ((h_r, h_k), b)),
+                (s_q_total, d, h_q, b),
                 stride=(
                     q_norm.stride[1],
                     q_norm.stride[4],
-                    ((q_norm.stride[3], q_norm.stride[2]), q_norm.stride[0]),
+                    q_norm.stride[3],
+                    q_norm.stride[0],
                 ),
             ),
         )
@@ -408,23 +410,79 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
         o = cute.make_tensor(
             o_norm.iterator,
             cute.make_layout(
-                (s_q_total, d, ((h_r, h_k), b)),
+                (s_q_total, d, h_q, b),
                 stride=(
                     o_norm.stride[1],
                     o_norm.stride[4],
-                    ((o_norm.stride[3], o_norm.stride[2]), o_norm.stride[0]),
+                    o_norm.stride[3],
+                    o_norm.stride[0],
                 ),
             ),
         )
         if cutlass.const_expr(lse_tensor is not None):
-            # (s, ((h_r, h_k), b))
+            # (s, h, b)
             lse_layout = cute.make_layout(
-                (s_lse64, ((h_r, h_k), b_lse)),
-                stride=(1, ((s_lse64, h_r64 * s_lse64), stride_b_lse)),
+                (s_lse64, h_q, b_lse),
+                stride=(1, s_lse64, stride_b_lse),
             )
             lse = cute.make_tensor(lse_tensor.iterator, lse_layout)
         else:
             lse = None
+
+        if cutlass.const_expr(self.pack_gqa):
+            q = pack_gqa_layout(q, self.qhead_per_kvhead, h_k, head_idx=2)
+            o = pack_gqa_layout(o, self.qhead_per_kvhead, h_k, head_idx=2)
+            if cutlass.const_expr(lse is not None):
+                lse = pack_gqa_layout(lse, self.qhead_per_kvhead, h_k, head_idx=1)
+
+        # The dedicated scheduler carries (head, batch) as one hierarchical
+        # mode. Re-nest the generic PackGQA view without changing its strides.
+        if cutlass.const_expr(self.pack_gqa):
+            q = cute.make_tensor(
+                q.iterator,
+                cute.make_layout(
+                    (q.shape[0], q.shape[1], (q.shape[2], q.shape[3])),
+                    stride=(q.stride[0], q.stride[1], (q.stride[2], q.stride[3])),
+                ),
+            )
+            o = cute.make_tensor(
+                o.iterator,
+                cute.make_layout(
+                    (o.shape[0], o.shape[1], (o.shape[2], o.shape[3])),
+                    stride=(o.stride[0], o.stride[1], (o.stride[2], o.stride[3])),
+                ),
+            )
+            if cutlass.const_expr(lse is not None):
+                lse = cute.make_tensor(
+                    lse.iterator,
+                    cute.make_layout(
+                        (lse.shape[0], (lse.shape[1], lse.shape[2])),
+                        stride=(lse.stride[0], (lse.stride[1], lse.stride[2])),
+                    ),
+                )
+        else:
+            q = cute.make_tensor(
+                q.iterator,
+                cute.make_layout(
+                    (q.shape[0], q.shape[1], ((h_r, h_k), b)),
+                    stride=(q.stride[0], q.stride[1], ((q_norm.stride[3], q_norm.stride[2]), q_norm.stride[0])),
+                ),
+            )
+            o = cute.make_tensor(
+                o.iterator,
+                cute.make_layout(
+                    (o.shape[0], o.shape[1], ((h_r, h_k), b)),
+                    stride=(o.stride[0], o.stride[1], ((o_norm.stride[3], o_norm.stride[2]), o_norm.stride[0])),
+                ),
+            )
+            if cutlass.const_expr(lse is not None):
+                lse = cute.make_tensor(
+                    lse.iterator,
+                    cute.make_layout(
+                        (lse.shape[0], ((h_r, h_k), b_lse)),
+                        stride=(lse.stride[0], ((s_lse64, h_r64 * s_lse64), stride_b_lse)),
+                    ),
+                )
 
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = q.element_type
@@ -436,6 +494,8 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
         # route admits at most four Q tokens per sequence, so one M tile per
         # batch is both sufficient and avoids multiplying the grid by total_q.
         grid_s_q = self.max_seqlen_q if cum_seqlen_q is not None else s_q
+        if cutlass.const_expr(self.pack_gqa and cum_seqlen_q is not None):
+            grid_s_q *= self.qhead_per_kvhead
         if cutlass.const_expr(self.use_clc_scheduler):
             self.tile_sched_params, grid = compute_grid_clc(
                 (grid_s_q, o.shape[1], o.shape[2]) if cum_seqlen_q is not None else o.shape,
@@ -990,7 +1050,7 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
                 )
                 continue_cond = False
                 batch_coord = curr_block_coord[2][1]
-                seqlen_q = mQ_qdl.shape[0]
+                seqlen_q = cute.size(mQ_qdl.shape[0])
                 seqlen_k = (
                     mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
                 )
@@ -1005,6 +1065,8 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
+                    if cutlass.const_expr(self.pack_gqa):
+                        seqlen_q *= self.qhead_per_kvhead
                     if cutlass.const_expr(cum_seqlen_k is not None):
                         cuseqlen_k = cum_seqlen_k[batch_coord]
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
@@ -1029,7 +1091,19 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
                 if cutlass.const_expr(mSeqUsedK is not None):
                     seqlen_k = mSeqUsedK[batch_coord]
                 if not continue_cond:
-                    mQ_qdl_ = cute.domain_offset(cute.select(block_offset, mode=[0, 2, 3]), mQ_qdl)
+                    if cutlass.const_expr(self.pack_gqa):
+                        mQ_qdl_ = (
+                            cute.domain_offset(
+                                ((Int32(0), cuseqlen_q), Int32(0), (Int32(0), Int32(0))),
+                                mQ_qdl,
+                            )
+                            if cutlass.const_expr(cum_seqlen_q is not None)
+                            else mQ_qdl
+                        )
+                    else:
+                        mQ_qdl_ = cute.domain_offset(
+                            cute.select(block_offset, mode=[0, 2, 3]), mQ_qdl
+                        )
                     # Local tile partition global tensors
                     q_cta_layout = cute.make_layout(
                         cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
@@ -1086,7 +1160,11 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
                     else:
                         # Paged path: page128 uses TMA, while page64 uses the
                         # generic d-offset-aware cp.async page manager.
-                        head_kv_coord = curr_block_coord[2][0] // self.qhead_per_kvhead
+                        head_kv_coord = (
+                            curr_block_coord[2][0]
+                            if cutlass.const_expr(self.pack_gqa)
+                            else curr_block_coord[2][0] // self.qhead_per_kvhead
+                        )
                         if cutlass.const_expr(self.use_tma_KV):
                             assert tma_atom_k is not None and tma_atom_v is not None
                             # Keep num_pages for page-index-based TMA.
@@ -1131,7 +1209,7 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
                     tQgQ = tQgQ_qdl[None, mma_block_coord[0], None, mma_block_coord[2]]
 
                     seqlen_kv_loop_start, seqlen_kv_loop_steps = (
-                        FusedMask.get_trip_start_count_via_block_info(
+                        self.get_trip_start_count(
                             mma_block_coord,
                             self.qk_mma_tiler,
                             seqlen_q,
@@ -1368,10 +1446,12 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
                     )
                     batch_coord = curr_block_coord[2][1]
                     continue_cond = False
-                    seqlen_q = mQ_qdl.shape[0]
+                    seqlen_q = cute.size(mQ_qdl.shape[0])
                     seqlen_k = max_seqlen_k
                     if cutlass.const_expr(cum_seqlen_q is not None):
                         seqlen_q = cum_seqlen_q[batch_coord + 1] - cum_seqlen_q[batch_coord]
+                        if cutlass.const_expr(self.pack_gqa):
+                            seqlen_q *= self.qhead_per_kvhead
                         if cutlass.const_expr(cum_seqlen_k is not None):
                             seqlen_k = (
                                 cum_seqlen_k[batch_coord + 1] - cum_seqlen_k[batch_coord]
@@ -1393,7 +1473,7 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
 
                     if not continue_cond:
                         _, seqlen_kv_loop_steps = (
-                            FusedMask.get_trip_start_count_via_block_info(
+                            self.get_trip_start_count(
                                 mma_block_coord,
                                 self.qk_mma_tiler,
                                 seqlen_q,
@@ -1444,7 +1524,7 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
                     curr_block_coord[2],
                 )
                 continue_cond = False
-                seqlen_q = mQ_qdl.shape[0]
+                seqlen_q = cute.size(mQ_qdl.shape[0])
                 seqlen_k = (
                     mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
                 )
@@ -1452,6 +1532,8 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
+                    if cutlass.const_expr(self.pack_gqa):
+                        seqlen_q *= self.qhead_per_kvhead
                     continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
                         self.qk_mma_tiler[0],
                         mma_block_coord[0],
@@ -1473,7 +1555,7 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
                         seqlen_k = mSeqUsedK[batch_coord]
 
                     seqlen_kv_loop_start, seqlen_kv_loop_steps = (
-                        FusedMask.get_trip_start_count_via_block_info(
+                        self.get_trip_start_count(
                             mma_block_coord,
                             self.qk_mma_tiler,
                             seqlen_q,
@@ -1679,7 +1761,7 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
                 )
                 batch_coord = curr_block_coord[2][1]
                 continue_cond = False
-                seqlen_q = mQ_qdl.shape[0]
+                seqlen_q = cute.size(mQ_qdl.shape[0])
                 seqlen_k = (
                     mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
                 )
@@ -1687,6 +1769,8 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
+                    if cutlass.const_expr(self.pack_gqa):
+                        seqlen_q *= self.qhead_per_kvhead
                     continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
                         self.qk_mma_tiler[0],
                         mma_block_coord[0],
@@ -1710,7 +1794,7 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
                     row_max_prev = -Float32.inf
                     row_sum = 0.0
 
-                    start_count, trip_count = FusedMask.get_trip_start_count_via_block_info(
+                    start_count, trip_count = self.get_trip_start_count(
                         mma_block_coord,
                         self.qk_mma_tiler,
                         seqlen_q,
@@ -1807,7 +1891,7 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
                     curr_block_coord[2],
                 )
                 batch_coord = curr_block_coord[2][1]
-                seqlen_q = mQ_qdl.shape[0]
+                seqlen_q = cute.size(mQ_qdl.shape[0])
                 seqlen_k = (
                     mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
                 )
@@ -1816,6 +1900,8 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
+                    if cutlass.const_expr(self.pack_gqa):
+                        seqlen_q *= self.qhead_per_kvhead
                     continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
                         self.qk_mma_tiler[0],
                         mma_block_coord[0],
@@ -1838,15 +1924,21 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
 
                     mO_qdl_eff = mO_qdl
                     if cutlass.const_expr(cum_seqlen_q is not None):
-                        block_offset_o = (
-                            cuseqlen_q,
-                            Int32(0),
-                            Int32(0),
-                            ((Int32(0), Int32(0)), Int32(0)),
-                        )
-                        mO_qdl_eff = cute.domain_offset(
-                            cute.select(block_offset_o, mode=[0, 2, 3]), mO_qdl
-                        )
+                        if cutlass.const_expr(self.pack_gqa):
+                            mO_qdl_eff = cute.domain_offset(
+                                ((Int32(0), cuseqlen_q), Int32(0), (Int32(0), Int32(0))),
+                                mO_qdl,
+                            )
+                        else:
+                            block_offset_o = (
+                                cuseqlen_q,
+                                Int32(0),
+                                Int32(0),
+                                ((Int32(0), Int32(0)), Int32(0)),
+                            )
+                            mO_qdl_eff = cute.domain_offset(
+                                cute.select(block_offset_o, mode=[0, 2, 3]), mO_qdl
+                            )
 
                     # (bM, bN, loopM, loopN, loopL)
                     gO_qdl = cute.flat_divide(
@@ -1857,7 +1949,7 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
                         cute.select(self.pv_block_tiler, mode=[0, 1]),
                     )
 
-                    _, seqlen_kv_loop_steps = FusedMask.get_trip_start_count_via_block_info(
+                    _, seqlen_kv_loop_steps = self.get_trip_start_count(
                         mma_block_coord,
                         self.qk_mma_tiler,
                         seqlen_q,
@@ -2145,6 +2237,34 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
         pipeline_cpasync.sync_object_full.arrive_cp_async_mbarrier(stage)
 
     @cute.jit
+    def get_trip_start_count(
+        self,
+        blk_coord: cute.Coord,
+        tile_shape: cute.Shape,
+        seqlen_q: Int32,
+        seqlen_k: Int32,
+        is_causal: cutlass.Constexpr[bool],
+        is_local: cutlass.Constexpr[bool],
+        window_size_left: Optional[Int32],
+        window_size_right: Optional[Int32],
+    ) -> Tuple[Int32, Int32]:
+        if cutlass.const_expr(self.pack_gqa):
+            # Packed rows interleave query heads, so a sequence-M block bound
+            # cannot describe their causal range. Decode all KV blocks and let
+            # the elementwise mask below map packed rows back to query tokens.
+            return Int32(0), cute.ceil_div(seqlen_k, tile_shape[1])
+        return FusedMask.get_trip_start_count_via_block_info(
+            blk_coord,
+            tile_shape,
+            seqlen_q,
+            seqlen_k,
+            is_causal,
+            is_local,
+            window_size_left,
+            window_size_right,
+        )
+
+    @cute.jit
     def softmax_step(
         self,
         mask_args: Tuple,
@@ -2179,17 +2299,34 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
         cute.arch.fence_view_async_tmem_load()
         s_handle.release()
         if need_apply_mask:
-            FusedMask.apply_mask_via_causal_local(
-                tTMEM_LOADrS,
-                tTMEM_LOADcS,
-                seqlen_q,
-                seqlen_k,
-                self.use_semantic_trip_range,
-                self.is_causal,
-                self.is_local,
-                window_size_left,
-                window_size_right,
-            )
+            if cutlass.const_expr(self.pack_gqa):
+                FusedMask.apply_mask_via_causal_local(
+                    tTMEM_LOADrS,
+                    tTMEM_LOADcS,
+                    seqlen_q // self.qhead_per_kvhead,
+                    seqlen_k,
+                    self.use_semantic_trip_range,
+                    self.is_causal,
+                    self.is_local,
+                    window_size_left,
+                    window_size_right,
+                    index_transform=lambda index_q, index_k: (
+                        index_q // self.qhead_per_kvhead,
+                        index_k,
+                    ),
+                )
+            else:
+                FusedMask.apply_mask_via_causal_local(
+                    tTMEM_LOADrS,
+                    tTMEM_LOADcS,
+                    seqlen_q,
+                    seqlen_k,
+                    self.use_semantic_trip_range,
+                    self.is_causal,
+                    self.is_local,
+                    window_size_left,
+                    window_size_right,
+                )
         old_row_max = row_max
         row_max_local = tTMEM_LOADrS.load().reduce(cute.ReductionOp.MAX, row_max, 0)
         sRowMax[row_idx, row_partial] = row_max_local
@@ -2430,7 +2567,12 @@ class BlackwellHd512FusedMultiHeadAttentionForward:
                 tSMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
                 o_vec = tTMrO.load()
                 tSMrO.store(o_vec.to(self.o_dtype))
-                if cute.elem_less(tTMEM_LOADcO_i[0][0], seqlen_q):
+                output_bound = (
+                    (self.qhead_per_kvhead, seqlen_q // self.qhead_per_kvhead)
+                    if cutlass.const_expr(self.pack_gqa)
+                    else seqlen_q
+                )
+                if cute.elem_less(tTMEM_LOADcO_i[0][0], output_bound):
                     cute.autovec_copy(tSMrO, tTMEM_LOADgO_i)
         o_handle.release()
         return mma_o_consumer, sum_consumer

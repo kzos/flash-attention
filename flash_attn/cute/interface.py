@@ -719,10 +719,41 @@ def _flash_attn_fwd(
     if softcap == 0.0:
         softcap = None
     qhead_per_kvhead = num_head // num_head_kv
+    requested_pack_gqa = pack_gqa
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
     if is_sm103_hd512_decode:
-        pack_gqa = False
+        # Fold the eight Q heads sharing each KV head into the M coordinate once
+        # the unpacked launch would require more than one residency wave.
+        # With the existing 2CTA physical M128 tile, grouped GQA wins once the
+        # unpacked launch would require enough residency waves to exceed the
+        # grouped path's extra logical-Q-row work.
+        # Preserve the public tri-state contract: True forces the specialization,
+        # False disables it, and None selects it only past the measured residency
+        # boundary. LSE uses a separate packed-coordinate store path that is not
+        # implemented by this specialization yet.
+        if requested_pack_gqa is True:
+            if return_lse or lse is not None:
+                raise NotImplementedError(
+                    "SM103 hd512 decode pack_gqa=True does not support LSE output"
+                )
+            pack_gqa = True
+        elif requested_pack_gqa is False:
+            pack_gqa = False
+        else:
+            # The grouped 2CTA path processes eight times as many logical Q rows
+            # per cluster. Its crossover therefore moves with decode Q length:
+            # B3/B5/B5/B7 for Q1/Q2/Q3/Q4 on B300.
+            auto_q_len = seqlen_q if cu_seqlens_q is None else max_seqlen_q
+            auto_pack_min_batch = (
+                2 * (auto_q_len // 2) + 3 if auto_q_len is not None else None
+            )
+            pack_gqa = (
+                auto_pack_min_batch is not None
+                and batch_size >= auto_pack_min_batch
+                and not return_lse
+                and lse is None
+            )
 
     is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     if is_fp8 and requires_grad:
@@ -822,7 +853,9 @@ def _flash_attn_fwd(
 
     if use_dedicated_hd512_kernel:
         assert 1 <= max_seqlen_q <= 4, "SM103 hd512 decode currently supports q_len 1 through 4"
-        assert tile_mn is None or tile_mn == (64, 128), "SM103 hd512 decode requires tile_mn=(64, 128)"
+        assert tile_mn is None or tile_mn == (64, 128), (
+            "SM103 hd512 decode requires tile_mn=(64, 128)"
+        )
         tile_mn = (64, 128)
         num_splits = 1
 
@@ -1399,8 +1432,11 @@ def _flash_attn_fwd(
                     # The paged-KV extent/page-table contract is normalized
                     # up front (see the page_table block above), so it holds by
                     # construction here.
-                    # pack_gqa is an auto-selected optimization; disable it for hd256 kernel
-                    pack_gqa = False
+                    # pack_gqa is an auto-selected optimization; the dedicated
+                    # hd256 path does not implement it. The SM103 hd512 path
+                    # uses it for dense and packed grouped-query decode.
+                    if use_dedicated_hd256_kernel:
+                        pack_gqa = False
 
                 flash_fwd_obj_cls = (
                     BlackwellHd512FusedMultiHeadAttentionForward
