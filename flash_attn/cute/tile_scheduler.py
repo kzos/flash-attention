@@ -1820,23 +1820,32 @@ class Sm100FmhaStaticTileScheduler:
         pass
 
     def __extract_mlir_values__(self):
-        values = extract_mlir_values(self._params)
-        values.extend(extract_mlir_values(self._current_work_linear_idx))
-        values.extend(extract_mlir_values(self._blk_coord))
-        values.extend(extract_mlir_values(self._grid_shape))
+        values, self._values_pos = [], []
+        for obj in [
+            self._params,
+            self._current_work_linear_idx,
+            self._blk_coord,
+            self._grid_shape,
+        ]:
+            obj_values = extract_mlir_values(obj)
+            values.extend(obj_values)
+            self._values_pos.append(len(obj_values))
         return values
 
     def __new_from_mlir_values__(self, values):
-        assert len(values) == 10
-        new_params = new_from_mlir_values(self._params, values[0:3])
-        new_current_work_linear_idx = new_from_mlir_values(
-            self._current_work_linear_idx, [values[3]]
-        )
-        new_blk_coord = new_from_mlir_values(self._blk_coord, values[4:7])
-        new_grid_shape = new_from_mlir_values(self._grid_shape, values[7:])
-        scheduler = Sm100FmhaStaticTileScheduler(
-            new_params, new_current_work_linear_idx, new_blk_coord, new_grid_shape
-        )
+        obj_list = []
+        for obj, n_items in zip(
+            [
+                self._params,
+                self._current_work_linear_idx,
+                self._blk_coord,
+                self._grid_shape,
+            ],
+            self._values_pos,
+        ):
+            obj_list.append(new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        scheduler = self.__class__(*obj_list, loc=self._loc)
         # See the note on Python-only attributes in SingleTileScheduler.
         scheduler._is_first_block = self._is_first_block
         return scheduler

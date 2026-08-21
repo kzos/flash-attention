@@ -91,6 +91,7 @@ DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 # SplitKV is not supported on SM90 or SM120
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 IS_SM100 = torch.cuda.get_device_capability()[0] == 10
+IS_SM103 = torch.cuda.get_device_capability() == (10, 3)
 IS_SM110 = torch.cuda.get_device_capability()[0] == 11
 IS_SM120 = torch.cuda.get_device_capability()[0] == 12
 TEST_BWD_ONLY = False
@@ -2530,6 +2531,128 @@ def test_flash_attn_paged_hd256_sm100_tma(seqlen_q):
     print(f"Paged determinism diff: {(out_paged_1 - out_paged_0).abs().max().item()}")
     assert torch.allclose(out_paged_0, out_ref, atol=1e-3, rtol=1e-3), "Paged output does not match non-paged reference"
     assert torch.equal(out_paged_1, out_paged_0), "Paged output is not deterministic"
+
+
+@pytest.mark.parametrize(
+    "batch_size,seqlen_q,max_seqlen_k",
+    [(1, 1, 129), (4, 4, 65)],
+)
+@pytest.mark.parametrize("page_size", [64, 128])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_paged_hd512_sm103_decode_compile(
+    batch_size, seqlen_q, max_seqlen_k, page_size
+):
+    """Compile the exact SM103 BF16 hd512 paged-decode specialization."""
+    if not USE_FAKE_TENSOR and not IS_SM103:
+        pytest.skip("SM103 hd512 runtime test requires an SM103 GPU")
+    device = "cuda"
+    dtype = torch.bfloat16
+    table_pages = math.ceil(max_seqlen_k / page_size) + 2
+    nheads, nheads_kv, d = 32, 4, 512
+
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(
+        batch_size * table_pages, page_size, nheads_kv, d, device=device, dtype=dtype
+    )
+    v = torch.randn_like(k)
+    page_table = torch.arange(
+        batch_size * table_pages, dtype=torch.int32, device=device
+    ).reshape(batch_size, table_pages)
+    seqused_k = torch.full(
+        (batch_size,), max_seqlen_k, dtype=torch.int32, device=device
+    )
+
+    result, _, _, _ = _flash_attn_fwd(
+        q,
+        k,
+        v,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        seqused_k=seqused_k,
+        page_table=page_table,
+        causal=True,
+        num_splits=0,
+        _arch=103,
+    )
+    assert result.shape == q.shape
+
+
+@pytest.mark.parametrize("page_size", [64, 128])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_paged_hd512_sm103_vllm_contract(page_size):
+    """Numerically verify ragged packed Q beyond two scheduler tiles."""
+    if not USE_FAKE_TENSOR and not IS_SM103:
+        pytest.skip("SM103 hd512 runtime test requires an SM103 GPU")
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, max_q_len, max_seqlen_k = 52, 4, 257
+    q_lengths = [1 + batch_idx % max_q_len for batch_idx in range(batch_size)]
+    cu_seqlens_q_host = [0, *itertools.accumulate(q_lengths)]
+    total_q = cu_seqlens_q_host[-1]
+    assert total_q == 130
+    nheads, nheads_kv, d = 32, 4, 512
+    required_pages = math.ceil(max_seqlen_k / page_size)
+    table_pages = required_pages + 3
+
+    q = torch.randn(total_q, nheads, d, device=device, dtype=dtype)
+    out = torch.empty_like(q)
+    cu_seqlens_q = torch.tensor(
+        cu_seqlens_q_host, dtype=torch.int32, device=device
+    )
+    k = torch.randn(
+        batch_size * table_pages, page_size, nheads_kv, d, device=device, dtype=dtype
+    )
+    v = torch.randn_like(k)
+    page_table = torch.randperm(
+        batch_size * table_pages, dtype=torch.int64, device=device
+    ).to(torch.int32).reshape(batch_size, table_pages)
+    seqused_k = torch.tensor(
+        [max_seqlen_k - 17 * (batch_idx % 4) for batch_idx in range(batch_size)],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    result, _, _, _ = _flash_attn_fwd(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max_q_len,
+        max_seqlen_k=max_seqlen_k,
+        seqused_k=seqused_k,
+        page_table=page_table,
+        causal=True,
+        num_splits=0,
+        out=out,
+        _arch=103,
+    )
+    assert result is out
+    if is_fake_mode():
+        return
+
+    reference = torch.empty_like(q, dtype=torch.float32)
+    scale = d**-0.5
+    for batch_idx in range(batch_size):
+        length = int(seqused_k[batch_idx])
+        q_start, q_end = cu_seqlens_q_host[batch_idx : batch_idx + 2]
+        q_len = q_end - q_start
+        pages = page_table[batch_idx, : math.ceil(length / page_size)].long()
+        k_seq = k[pages].reshape(-1, nheads_kv, d)[:length].float()
+        v_seq = v[pages].reshape(-1, nheads_kv, d)[:length].float()
+        k_seq = k_seq.repeat_interleave(nheads // nheads_kv, dim=1)
+        v_seq = v_seq.repeat_interleave(nheads // nheads_kv, dim=1)
+        scores = torch.einsum("qhd,khd->qhk", q[q_start:q_end].float(), k_seq) * scale
+        query_positions = torch.arange(
+            length - q_len, length, device=device
+        )[:, None]
+        key_positions = torch.arange(length, device=device)[None, :]
+        scores.masked_fill_(key_positions[None, :, :] > query_positions[:, None, :], float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        reference[q_start:q_end] = torch.einsum("qhk,khd->qhd", probs, v_seq)
+
+    torch.testing.assert_close(
+        result.float(), reference, atol=1e-2, rtol=1e-2
+    )
 
 
 @pytest.mark.parametrize("nheads_kv", [2, 4, 8])

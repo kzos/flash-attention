@@ -61,6 +61,9 @@ from flash_attn.cute.flash_bwd_mla_dk_sm100 import dKGemmKernel
 # SM100 head_dim=256 2CTA kernel imports
 from flash_attn.cute.sm100_hd256_2cta_fmha_forward import BlackwellFusedMultiHeadAttentionForward
 from flash_attn.cute.sm100_hd256_2cta_fmha_backward import BlackwellFusedMultiHeadAttentionBackward
+from flash_attn.cute.sm103_hd512_2cta_fmha_forward import (
+    BlackwellHd512FusedMultiHeadAttentionForward,
+)
 
 from flash_attn.cute.utils import AuxData
 from flash_attn.cute.block_sparsity import (
@@ -114,6 +117,7 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
     is_deepseek_shape = head_dim == 192 and head_dim_v == 128
     is_deepseek_mla_absorbed_shape = (head_dim == 64 or head_dim == head_dim_v) and head_dim_v == 512
     is_dedicate_kernel_shape = head_dim == 256 and head_dim_v == 256
+    is_sm103_decode_shape = head_dim == 512 and head_dim_v == 512
     is_standard_range = 8 <= head_dim <= 128 and 8 <= head_dim_v <= 128
 
     is_sm90_range = 8 <= head_dim <= 256 and 8 <= head_dim_v <= 256
@@ -123,9 +127,9 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
             f"head_dim and head_dim_v must be between 8 and 256 and divisible by {alignment}."
         )
     elif compute_capability in [10, 11]:
-        assert (is_standard_range or is_deepseek_shape or is_deepseek_mla_absorbed_shape or is_dedicate_kernel_shape) and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
+        assert (is_standard_range or is_deepseek_shape or is_deepseek_mla_absorbed_shape or is_dedicate_kernel_shape or is_sm103_decode_shape) and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
             f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM100/SM110. "
-            f"head_dim and head_dim_v must be between 8 and 128 and divisible by {alignment}, or (192, 128) for DeepSeek, or (256, 256) for hd256."
+            f"head_dim and head_dim_v must be between 8 and 128 and divisible by {alignment}, or (192, 128) for DeepSeek, (256, 256) for hd256, or (512, 512) for SM103 paged decode."
         )
 
 
@@ -683,6 +687,30 @@ def _flash_attn_fwd(
     alignment = 16 // v.element_size()
     if arch // 10 not in [8, 12]:
         _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
+    is_sm103_hd512_decode = qv is None and head_dim == 512 and head_dim_v == 512
+    if is_sm103_hd512_decode:
+        assert arch == 103, "Standard (512, 512) attention is only implemented for SM103"
+        assert q_dtype == torch.bfloat16 and v.dtype == torch.bfloat16, (
+            "SM103 hd512 decode currently requires BF16 Q/K/V"
+        )
+        assert num_head == 32 and num_head_kv == 4, (
+            "SM103 hd512 decode currently requires 32 Q heads and 4 KV heads"
+        )
+        assert not requires_grad, "SM103 hd512 decode is forward-only"
+        assert page_table is not None, "SM103 hd512 decode requires paged KV"
+        assert page_size in (64, 128), "SM103 hd512 decode requires page_size=64 or 128"
+        assert cu_seqlens_k is None and seqused_q is None, (
+            "SM103 hd512 decode supports packed Q plus seqused_k, not packed K or seqused_q"
+        )
+        assert score_mod is None and mask_mod is None, (
+            "SM103 hd512 decode does not support score_mod or mask_mod"
+        )
+        assert block_sparse_tensors is None and learnable_sink is None, (
+            "SM103 hd512 decode does not support block sparsity or learnable sinks"
+        )
+        assert aux_tensors is None and aux_scalars is None, (
+            "SM103 hd512 decode does not support auxiliary tensors or scalars"
+        )
     if softmax_scale is None:
         softmax_scale = (
             1.0 / math.sqrt(head_dim) if qv is None or q is None
@@ -693,6 +721,8 @@ def _flash_attn_fwd(
     qhead_per_kvhead = num_head // num_head_kv
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
+    if is_sm103_hd512_decode:
+        pack_gqa = False
 
     is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     if is_fp8 and requires_grad:
@@ -768,6 +798,8 @@ def _flash_attn_fwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right, mask_mod
     )
+    if is_sm103_hd512_decode:
+        assert causal and not local, "SM103 hd512 decode requires causal, non-local attention"
 
     requested_use_clc_scheduler = utils._get_use_clc_scheduler_default()
     requested_disable_2cta = utils._get_disable_2cta_default(is_fwd=True)
@@ -785,8 +817,16 @@ def _flash_attn_fwd(
 
     # hd=256 2CTA forward uses dedicated kernel (Blackwell family)
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
+    use_dedicated_hd512_kernel = is_sm103_hd512_decode
+    use_dedicated_kernel = use_dedicated_hd256_kernel or use_dedicated_hd512_kernel
 
-    if use_dedicated_hd256_kernel and page_table is not None:
+    if use_dedicated_hd512_kernel:
+        assert 1 <= max_seqlen_q <= 4, "SM103 hd512 decode currently supports q_len 1 through 4"
+        assert tile_mn is None or tile_mn == (64, 128), "SM103 hd512 decode requires tile_mn=(64, 128)"
+        tile_mn = (64, 128)
+        num_splits = 1
+
+    if use_dedicated_kernel and page_table is not None:
         # The dedicated kernel takes its paged KV extent from the page-table
         # width (`max_seqlen_k_paged = mPageTable.shape[1] * page_size`), so the
         # table has to describe exactly ceil(max_seqlen_k / page_size) pages.
@@ -801,8 +841,9 @@ def _flash_attn_fwd(
         # table conversion below, so tile selection, kernel specialization and
         # the device-side tensor all see the same (normalized) values.
         required_pages = (max_seqlen_k + page_size - 1) // page_size
+        dedicated_name = "SM103 hd512" if use_dedicated_hd512_kernel else "SM100 hd256"
         assert page_table.shape[1] >= required_pages, (
-            f"SM100 hd256 2CTA paged KV requires page_table to cover max_seqlen_k="
+            f"{dedicated_name} 2CTA paged KV requires page_table to cover max_seqlen_k="
             f"{max_seqlen_k}, i.e. at least ceil({max_seqlen_k} / {page_size}) = "
             f"{required_pages} pages, got page_table.shape[1]={page_table.shape[1]}"
         )
@@ -813,7 +854,7 @@ def _flash_attn_fwd(
             # exact-zero probability). Without it every sequence would silently
             # attend to the remainder of its last page.
             assert seqused_k is not None, (
-                f"SM100 hd256 2CTA paged KV rounds max_seqlen_k up to the page "
+                f"{dedicated_name} 2CTA paged KV rounds max_seqlen_k up to the page "
                 f"boundary ({max_seqlen_k} -> {required_pages * page_size}); pass "
                 f"seqused_k with the per-batch KV lengths so the tail inside the "
                 f"last page is masked, or pass a page-aligned max_seqlen_k"
@@ -873,7 +914,7 @@ def _flash_attn_fwd(
         and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)
     )
 
-    use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
+    use_2cta_instrs = use_2cta_instrs or use_dedicated_kernel
 
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
@@ -899,6 +940,8 @@ def _flash_attn_fwd(
     is_varlen_mha = is_varlen and qhead_per_kvhead == 1
     is_dense_noncausal = not is_varlen and not causal and not local
     use_clc_scheduler = requested_use_clc_scheduler and not is_varlen_mha and not is_dense_noncausal
+    if use_dedicated_hd512_kernel:
+        use_clc_scheduler = False
 
     if use_block_sparsity:
         # NB: pack_gqa requires block sparse head dim == 1 (broadcasted)
@@ -1002,8 +1045,8 @@ def _flash_attn_fwd(
     reuse_scheduler_metadata = scheduler_metadata is not None
     is_varlen_q = cu_seqlens_q is not None or seqused_q is not None
     cluster_shape_m = 2 if use_2cta_instrs else 1
-    if use_dedicated_hd256_kernel:
-        # The hd=256 2CTA fwd kernel does not support the dynamic-persistent scheduler.
+    if use_dedicated_kernel:
+        # Dedicated 2CTA forward kernels do not support the dynamic-persistent scheduler.
         scheduler_metadata = None
         reuse_scheduler_metadata = False
     if (
@@ -1011,7 +1054,7 @@ def _flash_attn_fwd(
         and is_varlen_q
         and scheduler_metadata is None
         and not disable_scheduler_metadata
-        and not use_dedicated_hd256_kernel
+        and not use_dedicated_kernel
     ):
         scheduler_metadata = _get_scheduler_metadata(
             num_batch=batch_size,
@@ -1076,7 +1119,7 @@ def _flash_attn_fwd(
         is_varlen_q
         and use_single_tile_varlen_scheduler
         and batch_size > BIN_BATCH_SEARCH_THRESH
-        and not use_dedicated_hd256_kernel
+        and not use_dedicated_kernel
     )
     if (
         use_cu_hint
@@ -1340,18 +1383,19 @@ def _flash_attn_fwd(
                     has_qk=has_qk,
                 )
             else:
-                if use_dedicated_hd256_kernel:
-                    # hd=256 2CTA forward: check for currently unsupported features
-                    assert softcap is None, "SM100 forward with head_dim=256 does not support softcap"
+                if use_dedicated_kernel:
+                    dedicated_name = "SM103 hd512" if use_dedicated_hd512_kernel else "SM100 hd256"
+                    assert softcap is None, f"{dedicated_name} forward does not support softcap"
                     assert not use_block_sparsity, \
-                        "SM100 forward with head_dim=256 does not support block sparsity"
+                        f"{dedicated_name} forward does not support block sparsity"
                     assert learnable_sink is None, \
-                        "SM100 forward with head_dim=256 does not support learnable_sink"
+                        f"{dedicated_name} forward does not support learnable_sink"
                     # The dedicated kernel derives K/V load offsets from
                     # cu_seqlens_q; varlen-packed K without varlen Q would be
                     # silently mis-addressed, so reject it loudly.
-                    assert cu_seqlens_k is None or cu_seqlens_q is not None, \
-                        "SM100 forward with head_dim=256 requires cu_seqlens_q when cu_seqlens_k is used"
+                    if use_dedicated_hd256_kernel:
+                        assert cu_seqlens_k is None or cu_seqlens_q is not None, \
+                            "SM100 forward with head_dim=256 requires cu_seqlens_q when cu_seqlens_k is used"
                     # The paged-KV extent/page-table contract is normalized
                     # up front (see the page_table block above), so it holds by
                     # construction here.
@@ -1359,9 +1403,13 @@ def _flash_attn_fwd(
                     pack_gqa = False
 
                 flash_fwd_obj_cls = (
-                    BlackwellFusedMultiHeadAttentionForward
-                    if use_dedicated_hd256_kernel
-                    else FlashAttentionForwardSm100
+                    BlackwellHd512FusedMultiHeadAttentionForward
+                    if use_dedicated_hd512_kernel
+                    else (
+                        BlackwellFusedMultiHeadAttentionForward
+                        if use_dedicated_hd256_kernel
+                        else FlashAttentionForwardSm100
+                    )
                 )
 
                 fa_fwd_kwargs = dict(
@@ -1385,8 +1433,10 @@ def _flash_attn_fwd(
                     use_clc_scheduler=use_clc_scheduler,
                     seqlen_k_per_split=seqlen_k_per_split,
                 )
-                if not use_dedicated_hd256_kernel:
+                if not use_dedicated_kernel:
                     fa_fwd_kwargs["has_tile_count_semaphore"] = tile_count_semaphore is not None
+                elif use_dedicated_hd512_kernel:
+                    fa_fwd_kwargs["max_seqlen_q"] = max_seqlen_q
                 fa_fwd = flash_fwd_obj_cls(head_dim, head_dim_v, **fa_fwd_kwargs)
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -1462,7 +1512,7 @@ def _flash_attn_fwd(
                 sparse_tensors,
                 AuxData(cute_aux_tensors, aux_scalars),
             ])
-            if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
+            if arch // 10 in [10, 11] and not use_dedicated_kernel:
                 compile_args.extend([
                     num_splits_dynamic_tensor,
                     tile_count_semaphore_tensor,
@@ -1551,7 +1601,7 @@ def _flash_attn_fwd(
                 else None,
                 AuxData(aux_tensors, aux_scalars),
             ])
-            if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
+            if arch // 10 in [10, 11] and not use_dedicated_kernel:
                 call_args.extend([
                     num_splits_dynamic,
                     tile_count_semaphore,
