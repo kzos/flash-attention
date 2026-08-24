@@ -2577,6 +2577,72 @@ def test_flash_attn_paged_hd512_sm103_decode_compile(
     assert result.shape == q.shape
 
 
+@pytest.mark.parametrize("seqlen_k", [11, 129, 1024, 4096])
+def test_sm103_hd512_splitkv_packed_hnd_adapter(seqlen_k):
+    """Validate the vLLM-style packed-HND Q1 adapter and split boundaries."""
+    if not IS_SM103 or USE_FAKE_TENSOR:
+        pytest.skip("packed-HND adapter runtime test requires an SM103 GPU")
+
+    from flash_attn.cute.sm103_hd512_splitkv_forward import (
+        run_sm103_hd512_splitkv_decode,
+    )
+
+    torch.manual_seed(20260824)
+    nheads, nheads_kv, d, page_size, num_splits = 32, 4, 512, 64, 32
+    table_pages = math.ceil(4096 / page_size) + 2
+    page_table = torch.arange(
+        table_pages, dtype=torch.int32, device="cuda"
+    ).roll(7)[None]
+    q = torch.randn(1, nheads, d, dtype=torch.bfloat16, device="cuda")
+    kv_packed = torch.randn(
+        table_pages,
+        nheads_kv,
+        page_size,
+        2 * d,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    k, v = kv_packed.split(d, dim=-1)
+    out = torch.empty_like(q)
+    out_partial = torch.empty(
+        num_splits, 1, nheads, d, dtype=torch.float32, device="cuda"
+    )
+    lse_partial = torch.empty(
+        num_splits, nheads, 1, dtype=torch.float32, device="cuda"
+    ).transpose(1, 2)
+    seqused_k = torch.tensor([seqlen_k], dtype=torch.int32, device="cuda")
+    valid_splits = torch.empty(1, dtype=torch.int32, device="cuda")
+
+    run_sm103_hd512_splitkv_decode(
+        q,
+        k,
+        v,
+        out,
+        out_partial,
+        lse_partial,
+        1.0,
+        seqused_k,
+        page_table,
+        valid_splits,
+    )
+
+    page_ids = page_table[0].long()
+    k_ref = k[page_ids].permute(0, 2, 1, 3).reshape(-1, nheads_kv, d)
+    v_ref = v[page_ids].permute(0, 2, 1, 3).reshape(-1, nheads_kv, d)
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        q.view(1, nheads, 1, d).float(),
+        k_ref[:seqlen_k].permute(1, 0, 2)[None].float(),
+        v_ref[:seqlen_k].permute(1, 0, 2)[None].float(),
+        scale=1.0,
+        enable_gqa=True,
+    ).view_as(q)
+    expected_splits = min(num_splits, math.ceil(seqlen_k / 128))
+    assert valid_splits.item() == expected_splits
+    torch.testing.assert_close(
+        out.float(), reference.to(torch.bfloat16).float(), atol=0.015625, rtol=0.0
+    )
+
+
 @pytest.mark.parametrize("page_size", [64, 128])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_paged_hd512_sm103_vllm_contract(page_size):
